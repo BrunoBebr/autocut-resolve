@@ -17,9 +17,9 @@
 **② Vyříznout ticho** — pokud je zaškrtnuté, ticha v audiu se při Aplikovat střih ořežou.
 
 **③ Práh / Min. ticho / Rezerva** — citlivost detekce ticha:
-- **Práh (dB)** — co je tišší než tento práh, se považuje za ticho (−30 dB je výchozí).
-- **Min. ticho (s)** — kratší pauzy se nechávají být (jinak by se rozsekala přirozená kadence).
-- **Rezerva (s)** — kolik vteřin dechu nechat kolem řeči, aby se neřezala slova.
+- **Práh (dB)**: horní mez prahu ticha (výchozí -30 dB). Skutečný práh se nastaví sám podle nahrávky, 15 dB pod úrovní řeči; tímhle polem ho jde jen snížit.
+- **Min. ticho (s)**: kratší pauzy se nechávají být (jinak by se rozsekala přirozená kadence). Výchozí 0,5 s.
+- **Rezerva (s)**: zkrácená pauza má aspoň dvojnásobek této hodnoty (výchozí 0,15 s, tedy 0,3 s); delší původní pauzy zůstanou o něco delší, nejvýš 0,8 s.
 
 **④ Vycpávková slova** — popisek sekce s vatou. Vata se filtruje, jakmile zaškrtneš aspoň jednu skupinu níže.
 

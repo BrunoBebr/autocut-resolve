@@ -11,7 +11,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import captions as captions_mod                      # noqa: E402
 from resolve_connect import get_context              # noqa: E402
-from silence import detect_silences, ffmpeg_available  # noqa: E402
+from silence import (detect_silences, ffmpeg_available, envelope,  # noqa: E402
+                     auto_threshold, pauses, FRAME_S)
 from transcribe import transcribe_media, Cancelled  # noqa: E402
 from fillers import build_filler_set, detect_filler_intervals  # noqa: E402
 from repeats import detect_repeat_intervals, detect_take_groups  # noqa: E402
@@ -21,13 +22,20 @@ from clips import read_v1_clips, clip_source_range_s, rebuild_from_keeps  # noqa
 DEFAULTS = {
     "cut_silences": True,
     "noise_db": -30,
-    "min_silence_dur": 0.5,
-    "silence_pad": 0.10,
+    "min_silence_dur": 0.5,       # only pauses longer than this are shortened
+    "silence_pad": 0.15,          # a shortened pause keeps at least 2x this...
+    "pause_ratio": 0.3,           # ...plus this share of the rest, so longer original
+    "pause_max": 0.8,             # pauses stay longer (rhythm), capped here (s)
 
     "remove_fillers": False,
     "filler_groups": ["hesitation", "verbal"],
     "filler_words": [],          # extra custom words
     "filler_pad": 0.02,          # trim a touch inside each filler
+    # Word cuts snap to the real pause/quietest point between words. Keep this
+    # much audio (s) next to the neighbouring kept word so its onset/tail survives.
+    "edge_keep": 0.04,
+    "min_pause": 0.06,           # shortest gap (s) that counts as a pause between words
+    "min_speech": 0.15,          # a kept piece with less speech than this (s) is dropped
 
     "remove_repeats": False,
     "repeat_threshold": 0.8,     # text-similarity to treat segments as re-takes
@@ -53,6 +61,82 @@ def _adjust(intervals, shrink):
         if e2 > s2:
             out.append((s2, e2))
     return out
+
+
+def _boundary(entry, lo, hi, cfg):
+    """Where to split between two words whose anchors are `lo` and `hi` (source s):
+    the longest real pause in between, else the quietest 10 ms frame.
+    Returns (start, end) of that pause; zero-length for a quiet point."""
+    if hi - lo < 0.1:  # no DTW anchors: whisper offsets touch, so search around them
+        lo, hi = lo - 0.15, hi + 0.15
+    env, t0 = entry["env"], entry["env_t0"]
+    i0 = max(0, int((lo - t0) / FRAME_S))
+    i1 = min(len(env), int((hi - t0) / FRAME_S) + 1)
+    if i1 <= i0:
+        return ((lo + hi) / 2,) * 2
+    found = pauses(env[i0:i1], entry["thr"], cfg["min_pause"], t0 + i0 * FRAME_S)
+    if found:
+        return max(found, key=lambda p: p[1] - p[0])
+    t = t0 + (min(range(i0, i1), key=env.__getitem__) + 0.5) * FRAME_S
+    return (t, t)
+
+
+def _transcript_cuts(entry, cfg):
+    """Cut intervals for one analysed clip. Each run of cut words is cut from
+    pause to pause in the real audio (whisper word times are too loose), keeping
+    the longer of the two pauses so the join breathes; plus long silences."""
+    words = entry["words"]
+    cs, ce = entry["src_range"]
+    a0 = lambda w: w.get("a0", w["start"])  # noqa: E731
+    a1 = lambda w: w.get("a1", w["end"])    # noqa: E731
+    k = cfg["edge_keep"]
+    cuts, i = [], 0
+    while i < len(words):
+        if not words[i]["cut"]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(words) and words[j + 1]["cut"]:
+            j += 1
+        lo, hi = (a1(words[i - 1]) if i else cs), a0(words[i])
+        p1 = _boundary(entry, min(lo, hi), max(lo, hi), cfg)
+        lo, hi = a1(words[j]), (a0(words[j + 1]) if j + 1 < len(words) else ce)
+        p2 = _boundary(entry, min(lo, hi), max(lo, hi), cfg)
+        if p1[1] - p1[0] >= p2[1] - p2[0]:   # keep the pause before the removed words
+            s, e = p1[1], max(p2[1] - k, p2[0])
+        else:                                # keep the pause after them
+            s, e = min(p1[0] + k, p1[1]), p2[0]
+        if e > s:
+            cuts.append((s, e))
+        i = j + 1
+    if cfg["cut_silences"]:
+        floor = 2 * cfg["silence_pad"]
+        edge = floor / 2
+        for s, e in pauses(entry["env"], entry["thr"], cfg["min_pause"], entry["env_t0"]):
+            if s <= cs + FRAME_S or e >= ce - FRAME_S:
+                # Pause at the clip's edge: the neighbouring clip brings its own,
+                # so keep only `edge` next to the speech.
+                if e - s > edge + 0.05:
+                    cuts.append((s, e - edge) if s <= cs + FRAME_S else (s + edge, e))
+                continue
+            if e - s < cfg["min_silence_dur"]:
+                continue
+            keep = min(e - s, cfg["pause_max"], floor + cfg["pause_ratio"] * (e - s - floor))
+            if e - s - keep > 0.05:  # remove the middle, keep keep/2 on each side
+                cuts.append((s + keep / 2, e - keep / 2))
+    return cuts
+
+
+def _keeps(entry, cfg):
+    """Segments to keep for one clip, minus any that hold no speech (breath or
+    room tone left between two cuts)."""
+    cs, ce = entry["src_range"]
+    keeps = keep_intervals(_transcript_cuts(entry, cfg), cs, ce, pad=0.0,
+                           min_keep_dur=cfg["min_keep_dur"])
+    env, t0, loud = entry["env"], entry["env_t0"], entry["thr"] + 6
+    def speech_s(a, b):
+        return FRAME_S * sum(v > loud for v in env[int((a - t0) / FRAME_S):int((b - t0) / FRAME_S)])
+    return [(a, b) for a, b in keeps if speech_s(a, b) >= cfg["min_speech"]]
 
 
 def _in_any(t, intervals):
@@ -127,7 +211,7 @@ def analyze(settings=None, log=print, resolve_app=None, cancel=None):
         {
           "fps": float,
           "clips": [ {"clip": clip_dict, "src_range": (cs, ce),
-                      "silences": [(s,e)...],   # source seconds
+                      "env": [dB per 10 ms], "env_t0": s, "thr": dB,
                       "words": [ {text,start,end,cut,reason}, ... ]} ],
         }
     Detection is non-destructive -- nothing changes in Resolve until apply().
@@ -183,14 +267,21 @@ def analyze(settings=None, log=print, resolve_app=None, cancel=None):
         phrases = _phrases_from_words(words)
         take_groups = detect_take_groups(phrases, threshold=cfg["repeat_threshold"])
 
-        # Always transcribe silence info so the silence checkbox works without
-        # re-analyzing (it's cheap energy analysis, not whisper).
-        silences = detect_silences(path, cfg["noise_db"], cfg["min_silence_dur"])
+        # Loudness envelope (cheap, not whisper): silences and word-cut snapping
+        # are computed from it at apply time, so panel changes need no re-analysis.
+        env = envelope(path, cs, ce - cs)
 
-        entry = {"clip": clip, "src_range": (cs, ce), "silences": silences,
+        entry = {"clip": clip, "src_range": (cs, ce), "env": env, "env_t0": cs,
                  "words": words, "phrases": phrases, "take_groups": take_groups}
         apply_detection(words, phrases, take_groups, cfg)
         out_clips.append(entry)
+
+    # One threshold for the whole timeline: a short clip holding only breath
+    # would otherwise get a threshold from its own noise and look like speech.
+    thr = auto_threshold([v for c in out_clips for v in c["env"]], cfg["noise_db"])
+    for c in out_clips:
+        c["thr"] = thr
+    log(f"Silence threshold {thr:.0f} dB (panel {cfg['noise_db']:.0f} dB).")
 
     n_cut = sum(1 for c in out_clips for w in c["words"] if w["cut"])
     log(f"Analysis done: {sum(len(c['words']) for c in out_clips)} words, "
@@ -216,14 +307,9 @@ def apply(analysis, settings=None, log=print, resolve_app=None, replace_timeline
     for entry in analysis["clips"]:
         clip = entry["clip"]
         cs, ce = entry["src_range"]
-        cuts = []
-        word_cuts = [(w["start"], w["end"]) for w in entry["words"] if w["cut"]]
-        cuts += _adjust(word_cuts, -cfg["filler_pad"])  # widen a touch to remove cleanly
-        if cfg["cut_silences"]:
-            cuts += _adjust(entry["silences"], cfg["silence_pad"])
-        keeps = keep_intervals(cuts, cs, ce, pad=0.0, min_keep_dur=cfg["min_keep_dur"])
+        keeps = _keeps(entry, cfg)
         removed = (ce - cs) - sum(b - a for a, b in keeps)
-        log(f"  [{clip['index']}] {len(cuts)} cut(s), {len(keeps)} keep(s), ~{removed:.1f}s removed.")
+        log(f"  [{clip['index']}] {len(keeps)} keep(s), ~{removed:.1f}s removed.")
         clip_keeps.append((clip, keeps))
 
     base_name = analysis.get("timeline_name") or timeline.GetName()
@@ -280,12 +366,7 @@ def build_caption_segments(analysis, cfg):
     words_tl = []
     t0 = 0.0  # running position on the rebuilt timeline
     for entry in analysis["clips"]:
-        cs, ce = entry["src_range"]
-        cuts = _adjust([(w["start"], w["end"]) for w in entry["words"] if w["cut"]],
-                       -cfg["filler_pad"])
-        if cfg["cut_silences"]:
-            cuts += _adjust(entry["silences"], cfg["silence_pad"])
-        keeps = keep_intervals(cuts, cs, ce, pad=0.0, min_keep_dur=cfg["min_keep_dur"])
+        keeps = _keeps(entry, cfg)
         kept = [w for w in entry["words"] if not w["cut"]]
         for a, b in keeps:
             for w in kept:

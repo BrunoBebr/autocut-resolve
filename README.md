@@ -1,4 +1,40 @@
-# AutoCut for DaVinci Resolve
+# AutoCut for DaVinci Resolve (improved fork)
+
+> Improved version of [StepanKakes/autocut-resolve](https://github.com/StepanKakes/autocut-resolve).
+> The tool and everything below this section are the original author's work;
+> this fork changes how cuts are placed so edits sound natural on quiet
+> recordings.
+
+## What this fork changes
+
+Tested on an 11-minute talking-head recording made with a quiet microphone
+(speech around -45 to -30 dBFS, noise floor around -85 dBFS).
+
+- **Silence threshold set from the recording.** The fixed -30 dB default
+  treated 98% of that recording as silence, so "silence" cuts landed inside
+  words. The threshold is now 15 dB below the speech level (never above the
+  panel's Práh), and one threshold covers the whole timeline.
+- **Word timing that follows the audio.** whisper.cpp word offsets touch each
+  other and drifted by up to 6 s at the start of the test clip. A second
+  whisper.cpp pass with DTW gives timing anchors, matched onto the main
+  transcript by text (the DTW pass drops some words, so it never replaces the
+  transcript). This adds one extra whisper pass to Analyse.
+- **Cuts land in real pauses.** Each run of removed words is cut from the real
+  pause (or the quietest 10 ms) before it to the one after it, keeping the
+  longer of the two pauses so the join breathes.
+- **Pauses keep their rhythm.** Long pauses are shortened in proportion to
+  their length (0.3 to 0.8 s by default) instead of all to one length.
+- **Nothing silent is left behind.** Pieces with no speech after cutting
+  (breath, room tone, clicks) are dropped, and pauses at clip edges are
+  trimmed so two clips don't stack their pauses at a join. Re-running AutoCut
+  on an already cut timeline works.
+- **Panel opens with current `mcp`.** `install.sh` pins the `mcp` Python SDK
+  below 2; version 2 removed `mcp.server.fastmcp` and the panel failed to open.
+
+Tuning lives in `DEFAULTS` in [core/engine.py](core/engine.py): `pause_ratio`,
+`pause_max`, `edge_keep`, `min_pause`, `min_speech`.
+
+***
 
 Self-hosted alternative to autocut.com, built on the DaVinci Resolve scripting
 API. Czech-first, runs entirely on your Mac (no cloud, no API keys), works in

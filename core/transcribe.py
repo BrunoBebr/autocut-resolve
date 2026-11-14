@@ -8,6 +8,7 @@ repeat detection).
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -84,7 +85,7 @@ def extract_audio(media_path, out_wav, start_s=None, dur_s=None, cancel=None):
 
 
 def transcribe_wav(wav_path, language="cs", model=None, whisper=None, max_len=0,
-                   log=print, cancel=None):
+                   log=print, cancel=None, dtw=None):
     """Run whisper-cli on a WAV and return a list of segments.
 
     Each segment: {"start": float_s, "end": float_s, "text": str}.
@@ -104,6 +105,9 @@ def transcribe_wav(wav_path, language="cs", model=None, whisper=None, max_len=0,
     ]
     if max_len:
         cmd += ["-ml", str(max_len), "-sow"]
+    if dtw:
+        # DTW token times need flash attention off (`dtw` is the model preset).
+        cmd += ["-ojf", "-dtw", dtw, "-nfa"]
     cmd += [wav_path]
 
     log(f"Transcribing ({os.path.basename(model)}, lang={language})...")
@@ -121,12 +125,30 @@ def transcribe_wav(wav_path, language="cs", model=None, whisper=None, max_len=0,
         text = (seg.get("text") or "").strip()
         if not text:
             continue
-        segments.append({
+        item = {
             "start": offs.get("from", 0) / 1000.0,  # ms -> s
             "end": offs.get("to", 0) / 1000.0,
             "text": text,
-        })
+        }
+        # DTW anchors (centiseconds): first/last real token, a point inside the word.
+        dtw = [t["t_dtw"] / 100.0 for t in seg.get("tokens", [])
+               if t.get("t_dtw", -1) >= 0 and not t.get("text", "").startswith("[_")]
+        if dtw:
+            item["a0"], item["a1"] = dtw[0], dtw[-1]
+        segments.append(item)
     return segments
+
+
+_DTW_PRESETS = {"tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium",
+                "medium.en", "large.v1", "large.v2", "large.v3", "large.v3.turbo"}
+
+
+def _dtw_preset(model_path):
+    """ggml-large-v3-turbo.bin -> 'large.v3.turbo'; None if whisper.cpp has no preset."""
+    name = os.path.basename(model_path)
+    name = re.sub(r"^ggml-|\.bin$", "", name)
+    name = re.sub(r"-q\d.*$", "", name).replace("-", ".")
+    return name if name in _DTW_PRESETS else None
 
 
 def transcribe_media(media_path, language="cs", start_s=None, dur_s=None,
@@ -135,7 +157,53 @@ def transcribe_media(media_path, language="cs", start_s=None, dur_s=None,
     with tempfile.TemporaryDirectory() as tmp:
         wav = os.path.join(tmp, "audio.wav")
         extract_audio(media_path, wav, start_s=start_s, dur_s=dur_s, cancel=cancel)
-        return transcribe_wav(wav, language=language, max_len=max_len, log=log, cancel=cancel)
+        words = transcribe_wav(wav, language=language, max_len=max_len, log=log, cancel=cancel)
+        preset = _dtw_preset(find_model() or "") if max_len else None
+        if preset:
+            # Word offsets from whisper.cpp touch each other and can be off by
+            # seconds. A second DTW pass gives anchors that track the audio; it
+            # decodes slightly differently (drops some words), so it only lends
+            # its timing to the first pass via text alignment.
+            log("Aligning word timing (DTW pass)...")
+            try:
+                ref = transcribe_wav(wav, language=language, max_len=max_len, log=log,
+                                     cancel=cancel, dtw=preset)
+                _attach_anchors(words, ref)
+            except Cancelled:
+                raise
+            except Exception as exc:  # timing falls back to whisper offsets
+                log(f"  DTW pass failed, using plain word times: {exc}")
+        return words
+
+
+def _norm(text):
+    return re.sub(r"[^\w%]", "", text.lower())
+
+
+def _attach_anchors(words, ref):
+    """Copy a0/a1 from DTW words `ref` onto matching `words`; words with no match
+    get anchors interpolated between their matched neighbours."""
+    import difflib
+    sm = difflib.SequenceMatcher(None, [_norm(w["text"]) for w in words],
+                                 [_norm(w["text"]) for w in ref], autojunk=False)
+    for i, j, n in sm.get_matching_blocks():
+        for k in range(n):
+            if "a0" in ref[j + k]:
+                words[i + k]["a0"], words[i + k]["a1"] = ref[j + k]["a0"], ref[j + k]["a1"]
+    i = 0
+    while i < len(words):
+        if "a0" in words[i]:
+            i += 1
+            continue
+        j = i
+        while j < len(words) and "a0" not in words[j]:
+            j += 1
+        lo = words[i - 1]["a1"] if i else words[i]["start"]
+        hi = words[j]["a0"] if j < len(words) else words[j - 1]["end"]
+        step = (hi - lo) / (j - i + 1)
+        for k in range(i, j):
+            words[k]["a0"] = words[k]["a1"] = lo + step * (k - i + 1)
+        i = j
 
 
 if __name__ == "__main__":
