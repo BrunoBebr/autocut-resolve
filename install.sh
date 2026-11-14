@@ -68,9 +68,9 @@ fi
 
 # 6b. Python deps for the in-process MCP server (Claude chat bridge)
 PY_BIN="$PY_FW/bin/python3"
-if ! "$PY_BIN" -c "import mcp" >/dev/null 2>&1; then
+if ! "$PY_BIN" -c "from mcp.server.fastmcp import FastMCP" >/dev/null 2>&1; then
   say "Installing 'mcp' Python SDK (for the Claude chat bridge)..."
-  "$PY_BIN" -m pip install --quiet 'mcp[cli]' fastmcp
+  "$PY_BIN" -m pip install --quiet 'mcp[cli]<2'  # core/mcp_server.py uses mcp.server.fastmcp, removed in mcp 2
 fi
 
 # 7. whisper model -- reuse any copy already on disk before downloading 1.5 GB.
